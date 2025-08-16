@@ -19,6 +19,7 @@ class ChatServer:
     def __init__(self, verbose=False):
         self.clients: Dict[websockets.WebSocketServerProtocol, Dict[str, Any]] = {}
         self.banned_ips: Set[str] = set()
+        self.user_contexts: Dict[str, list] = {}
         self.verbose = verbose
         self.setup_gemini()
     
@@ -30,32 +31,79 @@ class ChatServer:
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
     
-    async def moderate_content(self, message: str) -> bool:
+    async def moderate_content(self, message: str, user_ip: str) -> bool:
+        if user_ip not in self.user_contexts:
+            self.user_contexts[user_ip] = []
+        
+        self.user_contexts[user_ip].append(message)
+        
+        if len(self.user_contexts[user_ip]) > 10:
+            self.user_contexts[user_ip] = self.user_contexts[user_ip][-10:]
+        
+        context_messages = "\n".join(self.user_contexts[user_ip])
+        
         moderation_prompt = f"""
-        Analyze this message for any content related to:
-        - Child exploitation, abuse, or inappropriate content involving minors
-        - Pedophilia or sexual content involving children
-        - Child grooming behavior
-        - Violence against children
-        - MAP (Minor Attracted Person) terminology or symbols
-        - Age gap relationships involving minors
-        
-        Respond with only "BAN" if any of these topics are present, otherwise respond with "SAFE".
-        
-        Message to analyze: "{message}"
-        """
+        Analyze this conversation for content that could harm minors.
+
+        Current message: "{message}"
+        Full conversation: {context_messages}
+
+        DECODING INSTRUCTIONS:
+        Try Caesar cipher with ALL shifts (1-25), not just ROT13:
+        - Shift 1: A→B, B→C, etc.  
+        - Shift 7: A→H, B→I, etc.
+        - Shift 13: A→N, B→O, etc. (ROT13)
+        - Continue through all 25 shifts
+
+        LOOK FOR after decoding:
+        - Age gaps: minor (under 18) + adult 
+        - Phrases like "love young", "prefer minors", age preferences
+        - Grooming language
+        - Explicit content involving children
+
+        CRITICAL: If ANY Caesar shift reveals harmful content about minors, respond "BAN".
+
+        Examples that should be BAN:
+        - Two ages found: 14 and 45 
+        - "I love girls younger than 14"
+        - Any preference for minors
+
+        Respond only: BAN or SAFE"""
         
         try:
             if self.verbose:
                 logger.info(f"Sending to AI: {message}")
+                logger.info(f"Full context sent: {context_messages}")
             
-            response = self.model.generate_content(moderation_prompt)
+            safety_settings = [
+                {
+                    "category": "HARM_CATEGORY_HARASSMENT",
+                    "threshold": "BLOCK_NONE"
+                },
+                {
+                    "category": "HARM_CATEGORY_HATE_SPEECH", 
+                    "threshold": "BLOCK_NONE"
+                },
+                {
+                    "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                    "threshold": "BLOCK_NONE"
+                },
+                {
+                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                    "threshold": "BLOCK_NONE"
+                }
+            ]
+            
+            response = self.model.generate_content(
+                moderation_prompt,
+                safety_settings=safety_settings
+            )
             result = response.text.strip().upper()
             
             if self.verbose:
                 logger.info(f"AI Response: {result}")
             
-            return result == "BAN"
+            return "BAN" in result
         except Exception as e:
             logger.error(f"Moderation error: {e}")
             return True
@@ -86,7 +134,7 @@ class ChatServer:
             if self.verbose:
                 logger.info(f"AI Image Response: {result}")
             
-            return result == "BAN"
+            return "BAN" in result
         except Exception as e:
             logger.error(f"Image moderation error: {e}")
             return True
@@ -169,7 +217,7 @@ class ChatServer:
                 if not message_content:
                     return
                 
-                should_ban = await self.moderate_content(message_content)
+                should_ban = await self.moderate_content(message_content, client_ip)
                 
                 if should_ban:
                     logger.critical(f"HARMFUL CONTENT DETECTED from {client_ip}: {message_content}")
@@ -191,7 +239,7 @@ class ChatServer:
                 image_name = data.get('image_name', 'image.png')
                 
                 try:
-                    should_ban_name = await self.moderate_content(image_name)
+                    should_ban_name = await self.moderate_content(image_name, client_ip)
                     if should_ban_name:
                         logger.critical(f"HARMFUL IMAGE NAME DETECTED from {client_ip}: {image_name}")
                         await self.ban_client(websocket, "Harmful image name detected")
