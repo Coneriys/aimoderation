@@ -7,14 +7,19 @@ import google.generativeai as genai
 import os
 from typing import Set, Dict, Any
 import ipaddress
+import base64
+from PIL import Image
+import io
+import argparse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class ChatServer:
-    def __init__(self):
+    def __init__(self, verbose=False):
         self.clients: Dict[websockets.WebSocketServerProtocol, Dict[str, Any]] = {}
         self.banned_ips: Set[str] = set()
+        self.verbose = verbose
         self.setup_gemini()
     
     def setup_gemini(self):
@@ -32,6 +37,8 @@ class ChatServer:
         - Pedophilia or sexual content involving children
         - Child grooming behavior
         - Violence against children
+        - MAP (Minor Attracted Person) terminology or symbols
+        - Age gap relationships involving minors
         
         Respond with only "BAN" if any of these topics are present, otherwise respond with "SAFE".
         
@@ -39,11 +46,49 @@ class ChatServer:
         """
         
         try:
+            if self.verbose:
+                logger.info(f"Sending to AI: {message}")
+            
             response = self.model.generate_content(moderation_prompt)
             result = response.text.strip().upper()
+            
+            if self.verbose:
+                logger.info(f"AI Response: {result}")
+            
             return result == "BAN"
         except Exception as e:
             logger.error(f"Moderation error: {e}")
+            return True
+    
+    async def moderate_image(self, image_data: bytes) -> bool:
+        moderation_prompt = """
+        Analyze this image for any content related to:
+        - Child exploitation, abuse, or inappropriate content involving minors
+        - Nudity or sexual content involving children
+        - Child grooming behavior
+        - Violence against children
+        - Any harmful content targeting minors
+        - MAP pride flags or symbols
+        - Inappropriate symbols related to minors
+        
+        Respond with only "BAN" if any of these are present, otherwise respond with "SAFE".
+        """
+        
+        try:
+            image = Image.open(io.BytesIO(image_data))
+            
+            if self.verbose:
+                logger.info("Sending image to AI for analysis")
+            
+            response = self.model.generate_content([moderation_prompt, image])
+            result = response.text.strip().upper()
+            
+            if self.verbose:
+                logger.info(f"AI Image Response: {result}")
+            
+            return result == "BAN"
+        except Exception as e:
+            logger.error(f"Image moderation error: {e}")
             return True
     
     def get_client_ip(self, websocket):
@@ -116,29 +161,64 @@ class ChatServer:
     async def handle_message(self, websocket, message_data):
         try:
             data = json.loads(message_data)
-            message_content = data.get('message', '').strip()
-            
-            if not message_content:
-                return
-            
             client_ip = self.clients[websocket]['ip']
             
-            should_ban = await self.moderate_content(message_content)
+            if 'message' in data:
+                message_content = data.get('message', '').strip()
+                
+                if not message_content:
+                    return
+                
+                should_ban = await self.moderate_content(message_content)
+                
+                if should_ban:
+                    logger.critical(f"HARMFUL CONTENT DETECTED from {client_ip}: {message_content}")
+                    await self.ban_client(websocket, "Harmful content detected")
+                    return
+                
+                broadcast_data = {
+                    'type': 'message',
+                    'sender_ip': client_ip,
+                    'message': message_content,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                await self.broadcast_message(broadcast_data)
+                logger.info(f"Message from {client_ip}: {message_content}")
             
-            if should_ban:
-                logger.critical(f"HARMFUL CONTENT DETECTED from {client_ip}: {message_content}")
-                await self.ban_client(websocket, "Harmful content detected")
-                return
-            
-            broadcast_data = {
-                'type': 'message',
-                'sender_ip': client_ip,
-                'message': message_content,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            await self.broadcast_message(broadcast_data)
-            logger.info(f"Message from {client_ip}: {message_content}")
+            elif 'image' in data:
+                image_b64 = data.get('image')
+                image_name = data.get('image_name', 'image.png')
+                
+                try:
+                    should_ban_name = await self.moderate_content(image_name)
+                    if should_ban_name:
+                        logger.critical(f"HARMFUL IMAGE NAME DETECTED from {client_ip}: {image_name}")
+                        await self.ban_client(websocket, "Harmful image name detected")
+                        return
+                    
+                    image_data = base64.b64decode(image_b64)
+                    
+                    should_ban = await self.moderate_image(image_data)
+                    
+                    if should_ban:
+                        logger.critical(f"HARMFUL IMAGE DETECTED from {client_ip}")
+                        await self.ban_client(websocket, "Harmful image detected")
+                        return
+                    
+                    broadcast_data = {
+                        'type': 'image',
+                        'sender_ip': client_ip,
+                        'image': image_b64,
+                        'image_name': image_name,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    
+                    await self.broadcast_message(broadcast_data)
+                    logger.info(f"Image from {client_ip}: {image_name}")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing image: {e}")
             
         except json.JSONDecodeError:
             logger.error("Invalid JSON received")
@@ -159,7 +239,15 @@ class ChatServer:
             await self.unregister_client(websocket)
 
 async def main():
-    chat_server = ChatServer()
+    parser = argparse.ArgumentParser(description='AI Moderated Chat Server')
+    parser.add_argument('-v', '--verbose', action='store_true', 
+                       help='Enable verbose logging of AI responses')
+    args = parser.parse_args()
+    
+    chat_server = ChatServer(verbose=args.verbose)
+    
+    if args.verbose:
+        logger.info("Verbose mode enabled - AI responses will be logged")
     
     logger.info("Starting chat server with AI moderation on localhost:8765")
     
