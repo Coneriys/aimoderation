@@ -45,3 +45,7 @@ The system automatically detects and bans users who send content related to:
 - Violence against children
 
 Banned IPs are immediately disconnected and blocked from reconnecting.
+
+---
+
+**Is it really that hard, Roblox?**
